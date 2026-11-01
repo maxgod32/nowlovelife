@@ -1,0 +1,21 @@
+{
+  "name": "Now & Love",
+  "short_name": "Now & Love",
+  "description": "Sacred spiritual technology for infinite happiness, inner peace and enlightened love. Take the starseed quiz, find your life path number and begin within.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#06040f",
+  "theme_color": "#06040f",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

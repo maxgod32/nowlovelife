@@ -1,0 +1,12 @@
+{
+  "name": "nowlovelife",
+  "private": true,
+  "type": "module",
+  "description": "Now & Love website and the private sessions booking back end",
+  "dependencies": {
+    "@netlify/blobs": ">=8.1.0 <11"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

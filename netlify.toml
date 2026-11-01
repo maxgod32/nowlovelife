@@ -1,0 +1,11 @@
+# Now & Love: the website (public/) and the private sessions back end (netlify/functions).
+[build]
+  publish = "public"
+  command = "echo Site is prebuilt"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
