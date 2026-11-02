@@ -25,7 +25,9 @@ export async function update(key, fallback, fn) {
     const out = await fn(data);
     if (out === NO_CHANGE) return { data, out, written: false };
     const res = await store().setJSON(key, data, etag ? { onlyIfMatch: etag } : { onlyIfNew: true });
-    if (!res || res.modified !== false) return { data, out, written: true };
+    // Without conditional writes two visitors could take the same time, so refuse to run rather than risk it.
+    if (!res || typeof res.modified !== 'boolean') throw new Error('Netlify Blobs conditional writes are unavailable: update @netlify/blobs');
+    if (res.modified) return { data, out, written: true };
     await sleep(25 + Math.random() * 60 * (attempt + 1));
   }
   throw new HttpError(503, 'The calendar is busy right now. Please try again in a moment.');

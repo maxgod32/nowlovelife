@@ -26,9 +26,11 @@ export const DEFAULT_OFFERINGS = [
     description: 'Three private hours in one sitting, for a deeper turning point and a path you can walk on your own.' }
 ];
 
-/* Bookings that hold time on the calendar right now. */
+/* Bookings that hold time on the calendar right now. A hold whose Stripe checkout has not been settled stays
+   busy even after its timer runs out, until Stripe says the checkout expired: it may already be paid. */
 export function busyOf(bookings, now) {
-  return bookings.filter((b) => b.status === 'confirmed' || b.status === 'processing' || (b.status === 'hold' && b.holdUntil > now));
+  return bookings.filter((b) => b.status === 'confirmed' || b.status === 'processing' || b.status === 'review'
+    || (b.status === 'hold' && (b.holdUntil > now || !!b.stripeSession)));
 }
 
 /* Open start times (UTC ms) for one offering. from = { y, m, d } in Jorge's zone; days limits the scan. */

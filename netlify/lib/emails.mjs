@@ -31,12 +31,11 @@ export function clientConfirmed(b, config) {
   return { subject, html, text };
 }
 
-export function jorgeNewBooking(b, config, conflict) {
+export function jorgeNewBooking(b, config) {
   const when = fmtWhen(config.timezone, b.start, b.end);
-  const subject = (conflict ? 'Check this booking: ' : 'New booking: ') + b.client.name + ', ' + fmtShort(config.timezone, b.start);
-  const html = layout(conflict ? 'A booking overlaps another' : 'New session booked',
-    (conflict ? p('This payment arrived after its time was released, and it overlaps another booking. Please reach out to the client to move one of them.') : '')
-    + table([row('Client', esc(b.client.name)), row('Email', '<a style="color:#c58cff;" href="mailto:' + esc(b.client.email) + '">' + esc(b.client.email) + '</a>'),
+  const subject = 'New booking: ' + b.client.name + ', ' + fmtShort(config.timezone, b.start);
+  const html = layout('New session booked',
+    table([row('Client', esc(b.client.name)), row('Email', '<a style="color:#c58cff;" href="mailto:' + esc(b.client.email) + '">' + esc(b.client.email) + '</a>'),
       row('Phone', esc(b.client.phone || 'Not given')), row('Session', esc(b.offeringName)), row('When', esc(when)),
       row('Paid', esc(money(b.amountPaid != null ? b.amountPaid : b.priceCents)) + (b.payment === 'manual' ? ' (added by hand)' : ''))])
     + (b.client.intention ? p('<b style="color:#fff;">What they would like to bring:</b><br>' + esc(b.client.intention).replace(/\n/g, '<br>')) : '')
@@ -66,10 +65,33 @@ export function jorgeMessage(m) {
   return { subject, html, text };
 }
 
-export function clientMessageReceived(m) {
-  const subject = 'Jorge received your message';
-  const html = layout('Your message reached Jorge',
-    p('Thank you, ' + esc(first(m.name)) + '. Your words are with Jorge now, and he will answer you personally.')
-    + p('<span style="color:#a99fcf;">You wrote:</span><br>' + esc(m.text).replace(/\n/g, '<br>')));
-  return { subject, html, text: 'Thank you, ' + first(m.name) + '. Your message is with Jorge and he will answer you personally.\n\nYou wrote:\n' + m.text };
+/* Payment arrived but the time overlaps another booking: the client hears from Jorge personally. */
+export function clientPaymentReview(b, config) {
+  const subject = 'Jorge received your payment';
+  const html = layout('Your payment is received',
+    p('Thank you, ' + esc(first(b.client.name)) + '. Your payment for ' + esc(b.offeringName) + ' arrived, and Jorge will contact you personally to confirm your time.')
+    + p('Reply to this email to reach Jorge directly.'));
+  return { subject, html, text: 'Thank you. Your payment for ' + b.offeringName + ' arrived, and Jorge will contact you personally to confirm your time.' };
+}
+
+/* A payment arrived for a booking that had already been cancelled, so it was refunded. */
+export function clientRefundedUnavailable(b, config) {
+  const when = fmtWhen(config.timezone, b.start, b.end);
+  const subject = 'Your payment has been refunded';
+  const html = layout('This time is no longer available',
+    p('Dear ' + esc(first(b.client.name)) + ', the time you chose (' + esc(when) + ') was no longer available when your payment arrived, so your payment of '
+      + esc(money(b.amountPaid != null ? b.amountPaid : b.priceCents)) + ' has been refunded in full. Banks usually show it within 5 to 10 business days.')
+    + p('Reply to this email to reach Jorge, or choose a new time at nowlovelife.com/book.'));
+  return { subject, html, text: 'The time you chose (' + when + ') was no longer available, so your payment has been refunded in full.' };
+}
+
+/* Something Jorge should look at: a payment that needs a decision, a dispute, a refund that failed. */
+export function jorgeAlert(title, lines, b, config) {
+  const rows = [];
+  if (b) {
+    rows.push(row('Client', esc(b.client && b.client.name)), row('Email', esc(b.client && b.client.email)), row('Session', esc(b.offeringName)));
+    if (config && b.start) rows.push(row('When', esc(fmtWhen(config.timezone, b.start, b.end))));
+  }
+  const html = layout(title, lines.map((l) => p(esc(l))).join('') + (rows.length ? table(rows) : '') + p('Open your studio at nowlovelife.com/admin to take care of it.'));
+  return { subject: title, html, text: title + '\n\n' + lines.join('\n') };
 }

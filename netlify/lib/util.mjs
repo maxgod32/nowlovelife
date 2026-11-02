@@ -31,8 +31,10 @@ export function cleanText(v, max = 2000) {
   return String(v == null ? '' : v).replace(CTRL, '').replace(/\r\n?/g, '\n').replace(/\n{4,}/g, '\n\n\n').trim().slice(0, max);
 }
 
+/* Plain ASCII addresses only, no "?" or doubled dots, so Stripe and the email service accept every one we store. */
+const EMAIL_RE = /^(?!\.)(?!.*\.\.)[A-Za-z0-9.!#$%&'*+/=^_`{|}~-]{1,64}(?<!\.)@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24}$/;
 export function isEmail(e) {
-  return typeof e === 'string' && e.length <= 254 && /^[^\s@<>()[\],;:"\\]+@[^\s@<>()[\],;:"\\]+\.[a-z]{2,}$/i.test(e);
+  return typeof e === 'string' && e.length <= 254 && EMAIL_RE.test(e);
 }
 
 export function b64url(bytes) {
@@ -80,9 +82,19 @@ export function money(cents) {
   return '$' + n.toLocaleString('en-US', { minimumFractionDigits: n % 1 ? 2 : 0, maximumFractionDigits: 2 });
 }
 
+/* Netlify supplies the visitor address; nothing the visitor sends is trusted for it. */
 export function ipOf(req, context) {
-  return (context && context.ip) || req.headers.get('x-nf-client-connection-ip')
-    || (req.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+  return (context && context.ip) || req.headers.get('x-nf-client-connection-ip') || 'unknown';
+}
+
+/* IPv6 visitors control a whole /64, so limits apply to the network, not the single address. */
+export function netOf(ip) {
+  ip = String(ip || '').trim().toLowerCase();
+  if (!ip.includes(':')) return ip;
+  const [head, tail] = ip.split('::');
+  const a = head ? head.split(':') : [], z = tail ? tail.split(':') : [];
+  const full = ip.includes('::') ? [...a, ...Array(Math.max(0, 8 - a.length - z.length)).fill('0'), ...z] : a;
+  return full.slice(0, 4).map((h) => h.replace(/^0+(?=.)/, '')).join(':') + '::/64';
 }
 
 export function esc(s) {

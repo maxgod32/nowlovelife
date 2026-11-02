@@ -13,12 +13,15 @@ export async function send({ to, subject, html, text, replyTo, attachments }) {
   }
   const key = env('RESEND_API_KEY');
   if (!key) return { ok: false, skipped: true };
+  const post = (reply) => fetch((env('RESEND_API_BASE') || 'https://api.resend.com') + '/emails', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: fromAddress(), to: [].concat(to), subject, html, text, reply_to: reply || undefined, attachments }),
+    signal: AbortSignal.timeout(8000)
+  });
   try {
-    const res = await fetch((env('RESEND_API_BASE') || 'https://api.resend.com') + '/emails', {
-      method: 'POST',
-      headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: fromAddress(), to: [].concat(to), subject, html, text, reply_to: replyTo || undefined, attachments })
-    });
+    let res = await post(replyTo);
+    if (res.status === 422 && replyTo) res = await post(null);   // never lose an alert over the reply-to address
     if (!res.ok) { console.error('mail failed', res.status, await res.text()); return { ok: false }; }
     return { ok: true };
   } catch (e) {

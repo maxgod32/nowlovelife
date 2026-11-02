@@ -3,12 +3,17 @@
    Public:  GET  /api/public            sessions on offer, Jorge's time zone, where sessions happen
             GET  /api/slots             open start times for one session
             POST /api/book              hold a time and open Stripe Checkout
-            GET  /api/booking           booking status after payment (confirms with Stripe if needed)
+            GET  /api/booking           booking status after payment (asks Stripe if needed)
             POST /api/booking/release   give a held time back when someone leaves checkout
             GET  /api/booking/ics       calendar invite for a confirmed booking
             POST /api/message           message Jorge directly
-            POST /api/stripe-webhook    payment confirmations from Stripe
-   Jorge:   /api/admin/*                sign in, bookings, hours, sessions, messages, export */
+            POST /api/stripe-webhook    payment events from Stripe
+   Jorge:   /api/admin/*                sign in, bookings, hours, sessions, messages, export
+
+   Booking states: hold (checkout open) -> confirmed, or processing (slow bank payment) -> confirmed, or
+   review (paid, but the time overlaps another booking: Jorge decides). cancelled and expired free the time.
+   Only the booking's own Stripe checkout, at the right amount, can confirm it, and nothing brings a
+   cancelled booking back. */
 import { json, readBody, HttpError, clean, cleanText, isEmail, rid, ipOf, money } from '../lib/util.mjs';
 import { read, update, NO_CHANGE } from '../lib/store.mjs';
 import { DEFAULT_CONFIG, DEFAULT_OFFERINGS, computeSlots, busyOf } from '../lib/slots.mjs';
@@ -22,6 +27,8 @@ import { parts, parseDay, validTZ, hm, zoned, fmtWhen, fmtDay, fmtTime } from '.
 
 const HOLD_MINUTES = 33;      // a time stays held while its checkout is open
 const CHECKOUT_MINUTES = 31;  // Stripe's shortest allowed checkout lifetime is 30 minutes
+const MAX_OPEN_HOLDS = 10;    // unpaid checkouts open at once, across everyone
+const BOOKINGS_PER_HOUR = 6;  // checkouts one network can open per hour
 
 export default async function handler(req, context) {
   const url = new URL(req.url);
@@ -57,6 +64,7 @@ const notifyTo = (config) => config.notifyEmail || env('NOTIFY_EMAIL');
 const siteOrigin = (url) => (env('SITE_URL') || url.origin).replace(/\/+$/, '');
 const withJorge = (name) => (/jorge/i.test(name) ? name : name + ' with Jorge');
 const pubOffering = (o) => ({ id: o.id, name: o.name, description: o.description, minutes: o.minutes, priceCents: o.priceCents });
+const overlaps = (x, list, now) => busyOf(list, now).some((o) => o.id !== x.id && x.start < o.end && x.end > o.start);
 
 /* Change one booking under the ETag guard. fn(booking, list) may return NO_CHANGE. */
 async function changeBooking(id, fn) {
@@ -70,13 +78,45 @@ async function changeBooking(id, fn) {
   });
   return found;
 }
+async function changeByIntent(pi, fn) {
+  let found = null;
+  await update('bookings', { list: [] }, (d) => {
+    found = null;
+    const b = d.list.find((x) => x.paymentIntent === pi);
+    if (!b) return NO_CHANGE;
+    found = b;
+    return fn(b);
+  });
+  return found;
+}
 
-/* Abandoned checkouts are noise after a couple of days. */
+/* Old abandoned entries are noise. A hold with a Stripe checkout is never dropped until Stripe has settled it. */
 function prune(list, now) {
   for (let i = list.length - 1; i >= 0; i--) {
     const b = list[i];
-    if ((b.status === 'expired' || (b.status === 'hold' && b.holdUntil <= now)) && (b.createdAt || 0) < now - 2 * 864e5) list.splice(i, 1);
+    const old = (b.createdAt || 0) < now - 2 * 864e5;
+    if (old && (b.status === 'expired' || (b.status === 'hold' && !b.stripeSession && b.holdUntil <= now))) list.splice(i, 1);
   }
+}
+
+/* Holds whose timer ran out but whose checkout Stripe has not reported on: ask Stripe what happened. */
+async function resolveLapsed(list) {
+  const now = Date.now();
+  const due = list.filter((b) => b.status === 'hold' && b.stripeSession && b.holdUntil <= now && (!b.checkedAt || now - b.checkedAt > 120e3)).slice(0, 4);
+  for (const b of due) {
+    let s = null;
+    try { s = await stripe.getCheckout(b.stripeSession); } catch (e) { /* try again later */ }
+    if (s && s.status !== 'open') await applyCheckout(b.id, s);
+    else await changeBooking(b.id, (x) => { x.checkedAt = Date.now(); }).catch(() => {});
+  }
+  return due.length > 0;
+}
+
+async function alertJorge(title, lines, b, config) {
+  config = config || await getConfig();
+  const to = notifyTo(config);
+  if (!to) { console.error('alert with no one to tell:', title, lines.join(' ')); return; }
+  await mail.send({ to, ...tpl.jorgeAlert(title, lines, b, config), replyTo: (b && b.client && b.client.email) || undefined });
 }
 
 /* ---------- public ---------- */
@@ -91,7 +131,9 @@ async function getPublic() {
 }
 
 async function getSlots(req, url) {
-  const [config, offerings, bookings] = await Promise.all([getConfig(), getOfferings(), getBookings()]);
+  const [config, offerings] = await Promise.all([getConfig(), getOfferings()]);
+  let bookings = await getBookings();
+  if (await resolveLapsed(bookings)) bookings = await getBookings();
   const id = url.searchParams.get('offering');
   const offering = offerings.find((o) => o.active && (!id || o.id === id));
   if (!offering) throw new HttpError(404, 'That session is not available right now.');
@@ -106,34 +148,39 @@ async function postBook(req, url, context) {
   const name = clean(b.name, 80), email = clean(b.email, 254).toLowerCase(), phone = clean(b.phone, 40), intention = cleanText(b.intention, 1500);
   if (name.length < 2) throw new HttpError(400, 'Please add your name.', { field: 'name' });
   if (!isEmail(email)) throw new HttpError(400, 'Please check your email address.', { field: 'email' });
-  const start = Number(b.start);
-  if (!Number.isFinite(start) || start % 60000 !== 0) throw new HttpError(400, 'Please choose a time.');
+  const now = Date.now(), start = Number(b.start);
+  if (!Number.isFinite(start) || start % 60000 !== 0 || start < now - 864e5 || start > now + 400 * 864e5) throw new HttpError(400, 'Please choose a time.');
 
   const [config, offerings] = await Promise.all([getConfig(), getOfferings()]);
   const offering = offerings.find((o) => o.active && o.id === b.offering);
   if (!offering) throw new HttpError(404, 'That session is not available right now.');
   const paid = offering.priceCents > 0;
   if (paid && stripe.mode() === 'off') throw new HttpError(503, 'Online booking opens very soon. Please message Jorge and he will book you in.');
-  if (!(await auth.throttle('book', ipOf(req, context), 12, 3600e3))) throw new HttpError(429, 'Too many booking attempts from here. Please wait a little and try again.');
+  if (!(await auth.throttle('book', ipOf(req, context), BOOKINGS_PER_HOUR, 3600e3))) throw new HttpError(429, 'Too many booking attempts from here. Please wait a little and try again.');
+  await resolveLapsed(await getBookings());
 
-  const now = Date.now(), id = rid(15);
+  const id = rid(15);
   const booking = {
-    id, status: 'hold', offeringId: offering.id, offeringName: offering.name, minutes: offering.minutes, priceCents: offering.priceCents,
-    start, end: start + offering.minutes * 60e3, holdUntil: now + HOLD_MINUTES * 60e3, createdAt: now, payment: paid ? 'stripe' : 'free',
+    id, status: paid ? 'hold' : 'confirmed', offeringId: offering.id, offeringName: offering.name, minutes: offering.minutes, priceCents: offering.priceCents,
+    start, end: start + offering.minutes * 60e3, createdAt: now, payment: paid ? 'stripe' : 'free',
+    ...(paid ? { holdUntil: now + HOLD_MINUTES * 60e3 } : { confirmedAt: now, amountPaid: 0 }),
     client: { name, email, phone, intention }
   };
-  const day = parts(config.timezone, start);
+  const prev = parts(config.timezone, start - 864e5);
   await update('bookings', { list: [] }, (d) => {
     prune(d.list, now);
-    const open = computeSlots({ config, offering, bookings: d.list, now, from: { y: day.y, m: day.m, d: day.d }, days: 1 });
+    const open = computeSlots({ config, offering, bookings: d.list, now, from: { y: prev.y, m: prev.m, d: prev.d }, days: 3 });
     if (!open.includes(start)) throw new HttpError(409, 'That time was just taken. Please choose another.', { code: 'taken' });
-    const waiting = d.list.filter((x) => x.status === 'hold' && x.holdUntil > now && x.client && x.client.email === email).length;
-    if (waiting >= 3) throw new HttpError(429, 'You already have times waiting for payment. Please finish or release those first.');
+    if (paid) {
+      const waiting = d.list.filter((x) => x.status === 'hold' && x.holdUntil > now);
+      if (waiting.length >= MAX_OPEN_HOLDS) throw new HttpError(429, 'Many people are booking right now. Please try again in a few minutes.');
+      if (waiting.filter((x) => x.client && x.client.email === email).length >= 2) throw new HttpError(429, 'You already have times waiting for payment. Please finish or release those first.');
+    }
     d.list.push(booking);
   });
 
   if (!paid) {
-    await confirmBooking(id, { amount: 0 });
+    await sendConfirmations(booking, config);
     return json({ id, confirmed: true });
   }
 
@@ -153,7 +200,7 @@ async function postBook(req, url, context) {
       cancel_url: site + '/book/?released=' + id
     }, 'nl-book-' + id);
   } catch (e) {
-    await changeBooking(id, (x) => { if (x.status !== 'hold') return NO_CHANGE; x.status = 'expired'; });
+    await changeBooking(id, (x) => { if (x.status !== 'hold' || x.stripeSession) return NO_CHANGE; x.status = 'expired'; });
     throw e;
   }
   await changeBooking(id, (x) => { x.stripeSession = session.id; });
@@ -163,7 +210,7 @@ async function postBook(req, url, context) {
 function publicBooking(b, config) {
   return {
     id: b.id, status: b.status, offeringName: b.offeringName, minutes: b.minutes, priceCents: b.priceCents,
-    amountPaid: b.amountPaid, start: b.start, end: b.end, timezone: config.timezone, location: config.location,
+    amountPaid: b.amountPaid, refunded: !!b.refunded, start: b.start, end: b.end, timezone: config.timezone, location: config.location,
     policy: config.policy, firstName: String((b.client && b.client.name) || '').split(/\s+/)[0], email: mail.mailReady()
   };
 }
@@ -178,37 +225,86 @@ async function getBooking(req, url) {
   return json(publicBooking(b, await getConfig()));
 }
 
+/* What Stripe says about a checkout, applied to its booking. Only the booking's own checkout counts. */
 async function applyCheckout(id, s) {
-  if (s.payment_status === 'paid' || s.payment_status === 'no_payment_required') {
-    return confirmBooking(id, { paymentIntent: s.payment_intent, amount: s.amount_total });
+  const b0 = (await getBookings()).find((x) => x.id === id);
+  if (!b0) return null;
+  if (!s || !b0.stripeSession || s.id !== b0.stripeSession) return b0;
+  const paid = s.payment_status === 'paid' || s.payment_status === 'no_payment_required';
+  if (paid) {
+    if (s.amount_total !== b0.priceCents || String(s.currency || 'usd').toLowerCase() !== 'usd') {
+      let first = false;
+      await changeBooking(id, (x) => { first = !x.mismatch; if (!first) return NO_CHANGE; x.mismatch = true; });
+      if (first) await alertJorge('A payment did not match its booking', ['Stripe reported ' + money(s.amount_total) + ' ' + String(s.currency || '').toUpperCase()
+        + ' for a ' + money(b0.priceCents) + ' session, so the booking was not confirmed. Please check this payment in Stripe.'], b0);
+      return b0;
+    }
+    return settlePaid(id, s);
   }
-  if (s.status === 'complete') {   // a delayed payment method: keep the time while it clears
-    return changeBooking(id, (x) => {
-      if (x.status !== 'hold' && x.status !== 'expired') return NO_CHANGE;
-      x.status = 'processing'; delete x.holdUntil;
-    });
-  }
+  if (s.status === 'complete') return markProcessing(id, s);
   if (s.status === 'expired') return changeBooking(id, (x) => { if (x.status !== 'hold') return NO_CHANGE; x.status = 'expired'; });
-  return null;
+  return b0;
 }
 
-async function confirmBooking(id, pay) {
-  let changed = false, conflict = false;
+async function settlePaid(id, s) {
+  let outcome = null;
   const b = await changeBooking(id, (x, list) => {
-    changed = false; conflict = false;
-    if (x.status === 'confirmed') return NO_CHANGE;
+    outcome = null;
     const now = Date.now();
-    conflict = busyOf(list, now).some((o) => o.id !== x.id && x.start < o.end && x.end > o.start);
-    x.status = 'confirmed'; x.confirmedAt = now; delete x.holdUntil;
-    if (pay.paymentIntent) x.paymentIntent = pay.paymentIntent;
-    x.amountPaid = pay.amount != null ? pay.amount : x.priceCents;
-    if (conflict) x.conflict = true;
+    if (x.status === 'confirmed' || x.status === 'review') return NO_CHANGE;
+    if (x.status === 'cancelled') {
+      // A repeat of a payment already handled changes nothing. A first payment for a cancelled booking is refunded,
+      // unless Jorge chose to keep it when he cancelled.
+      if (x.refunded || x.confirmedAt || x.paidAt || x.paidAfterCancel) return NO_CHANGE;
+      x.paidAfterCancel = true; x.paidAt = now; x.paymentIntent = s.payment_intent || x.paymentIntent; x.amountPaid = s.amount_total;
+      outcome = x.keepPayment ? 'kept' : 'refund';
+      return;
+    }
+    x.paymentIntent = s.payment_intent || x.paymentIntent;
+    x.amountPaid = s.amount_total != null ? s.amount_total : x.priceCents;
+    x.paidAt = now; delete x.holdUntil;
+    if (overlaps(x, list, now)) { x.status = 'review'; outcome = 'review'; }
+    else { x.status = 'confirmed'; x.confirmedAt = now; outcome = 'confirmed'; }
+  });
+  if (!b || !outcome) return b;
+  const config = await getConfig();
+  if (outcome === 'confirmed') await sendConfirmations(b, config);
+  else if (outcome === 'review') {
+    await Promise.all([
+      b.client.email ? mail.send({ to: b.client.email, ...tpl.clientPaymentReview(b, config), replyTo: notifyTo(config) || undefined }) : null,
+      alertJorge('A paid booking needs your decision', ['This payment arrived for a time that overlaps another booking. In your studio, confirm it anyway or cancel and refund it, and let the client know.'], b, config)
+    ]);
+  } else if (outcome === 'refund') {
+    let refundId = null;
+    try { refundId = b.paymentIntent ? (await stripe.refund(b.paymentIntent, 'nl-refund-' + b.id)).id : null; } catch (e) { /* reported below */ }
+    if (refundId) {
+      await changeBooking(b.id, (x) => { x.refunded = true; x.refundId = refundId; });
+      await Promise.all([
+        b.client.email ? mail.send({ to: b.client.email, ...tpl.clientRefundedUnavailable(b, config), replyTo: notifyTo(config) || undefined }) : null,
+        alertJorge('A late payment was refunded', ['A payment arrived for a booking that was already cancelled, so it was refunded automatically.'], b, config)
+      ]);
+    } else {
+      await changeBooking(b.id, (x) => { x.refundFailed = true; });
+      await alertJorge('Please refund this payment', ['A payment arrived for a booking that was already cancelled, and the automatic refund did not go through. Please refund it in Stripe.'], b, config);
+    }
+  } else if (outcome === 'kept') {
+    await alertJorge('A payment arrived for a cancelled booking', ['You chose to keep the payment when you cancelled this booking. Refund it in Stripe if you change your mind.'], b, config);
+  }
+  return b;
+}
+
+/* A slow payment method (like a bank transfer) finished checkout: the time stays held while it clears. */
+async function markProcessing(id, s) {
+  let clash = false, changed = false;
+  const b = await changeBooking(id, (x, list) => {
+    changed = false; clash = false;
+    if (x.status !== 'hold' && x.status !== 'expired') return NO_CHANGE;
+    x.status = 'processing'; x.paymentIntent = s.payment_intent || x.paymentIntent; x.processingSince = Date.now(); delete x.holdUntil;
+    clash = overlaps(x, list, Date.now());
+    if (clash) x.clash = true;
     changed = true;
   });
-  if (b && changed) {
-    const config = await getConfig();
-    await Promise.all([sendClientConfirmation(b, config), sendJorgeAlert(b, config, conflict)]);
-  }
+  if (b && changed && clash) await alertJorge('A payment in progress overlaps another booking', ['This bank payment is still clearing, and its time overlaps another booking. It will wait for your decision once it clears.'], b);
   return b;
 }
 
@@ -218,27 +314,31 @@ function invite(b, config) {
     description: 'Your private session with Jorge, Now & Love.\n' + config.location, location: config.location, url: site + '/book/' });
 }
 async function sendClientConfirmation(b, config) {
-  if (!b.client || !b.client.email) return;
-  const m = tpl.clientConfirmed(b, config);
-  await mail.send({ to: b.client.email, ...m, replyTo: notifyTo(config) || undefined,
+  if (!b.client || !b.client.email) return { ok: false, skipped: true };
+  return mail.send({ to: b.client.email, ...tpl.clientConfirmed(b, config), replyTo: notifyTo(config) || undefined,
     attachments: [{ filename: 'now-and-love-session.ics', content: toBase64(invite(b, config)) }] });
 }
-async function sendJorgeAlert(b, config, conflict) {
+async function sendConfirmations(b, config) {
   const to = notifyTo(config);
-  if (!to) return;
-  const m = tpl.jorgeNewBooking(b, config, conflict);
-  await mail.send({ to, ...m, replyTo: (b.client && b.client.email) || undefined });
+  const [c] = await Promise.all([
+    sendClientConfirmation(b, config),
+    to ? mail.send({ to, ...tpl.jorgeNewBooking(b, config), replyTo: (b.client && b.client.email) || undefined }) : null
+  ]);
+  if (c && c.ok === false && !c.skipped) await changeBooking(b.id, (x) => { x.mailFailed = true; }).catch(() => {});
 }
 
+/* Someone left Stripe's checkout. Close the checkout first; only a checkout Stripe confirms closed frees the time. */
 async function postRelease(req) {
   const { id } = await readBody(req, 2000);
-  let sid = null;
-  await changeBooking(clean(id, 40), (x) => {
-    sid = null;
-    if (x.status !== 'hold') return NO_CHANGE;
-    x.status = 'expired'; x.releasedAt = Date.now(); sid = x.stripeSession || null;
-  });
-  if (sid) { try { await stripe.expireCheckout(sid); } catch (e) { /* already finished: the webhook settles it */ } }
+  const b = (await getBookings()).find((x) => x.id === clean(id, 40));
+  if (!b || b.status !== 'hold') return json({ ok: true });
+  if (b.stripeSession) {
+    let s = null;
+    try { s = await stripe.expireCheckout(b.stripeSession); } catch (e) { try { s = await stripe.getCheckout(b.stripeSession); } catch (e2) { /* settles later */ } }
+    if (s) await applyCheckout(b.id, s);
+    return json({ ok: true });
+  }
+  await changeBooking(b.id, (x) => { if (x.status !== 'hold') return NO_CHANGE; x.status = 'expired'; x.releasedAt = Date.now(); });
   return json({ ok: true });
 }
 
@@ -262,11 +362,7 @@ async function postMessage(req, url, context) {
   await update('messages', { list: [] }, (d) => { d.list.unshift(msg); if (d.list.length > 500) d.list.length = 500; });
   const config = await getConfig();
   const to = notifyTo(config);
-  const j = tpl.jorgeMessage(msg), c = tpl.clientMessageReceived(msg);
-  await Promise.all([
-    to ? mail.send({ to, ...j, replyTo: email }) : null,
-    mail.send({ to: email, ...c, replyTo: to || undefined })
-  ]);
+  if (to) await mail.send({ to, ...tpl.jorgeMessage(msg), replyTo: email });
   return json({ ok: true });
 }
 
@@ -277,16 +373,42 @@ async function postWebhook(req) {
   }
   let ev;
   try { ev = JSON.parse(raw); } catch (e) { return json({ error: 'Invalid payload' }, 400); }
-  const s = (ev.data && ev.data.object) || {};
-  const id = (s.metadata && s.metadata.bookingId) || s.client_reference_id;
-  if (!id) return json({ received: true });
-  if (ev.type === 'checkout.session.completed' || ev.type === 'checkout.session.async_payment_succeeded') await applyCheckout(id, s);
-  else if (ev.type === 'checkout.session.expired') await changeBooking(id, (x) => { if (x.status !== 'hold') return NO_CHANGE; x.status = 'expired'; });
-  else if (ev.type === 'checkout.session.async_payment_failed') {
-    await changeBooking(id, (x) => {
-      if (x.status !== 'processing') return NO_CHANGE;
-      x.status = 'cancelled'; x.cancelledAt = Date.now(); x.cancelReason = 'The payment did not go through';
+  const o = (ev.data && ev.data.object) || {};
+  const type = String(ev.type || '');
+  if (type.startsWith('checkout.session.')) {
+    const id = o.metadata && o.metadata.bookingId;
+    if (!id) return json({ received: true });     // not a booking checkout
+    const b = (await getBookings()).find((x) => x.id === id);
+    if (!b) {
+      if (type === 'checkout.session.completed' && o.payment_status === 'paid') {
+        await alertJorge('A payment arrived for a booking that is not on file', ['Stripe checkout ' + o.id + ' paid ' + money(o.amount_total) + ' from '
+          + ((o.customer_details && o.customer_details.email) || o.customer_email || 'an unknown email') + '. Please find it in Stripe and refund it or arrange a time.'], null);
+      }
+      return json({ received: true });
+    }
+    if (type === 'checkout.session.async_payment_failed') {
+      if (o.id === b.stripeSession) {
+        await changeBooking(id, (x) => {
+          if (!['hold', 'expired', 'processing'].includes(x.status)) return NO_CHANGE;
+          x.status = 'cancelled'; x.cancelledAt = Date.now(); x.cancelReason = 'The payment did not go through'; x.paymentFailed = true; delete x.holdUntil;
+        });
+      }
+    } else {
+      await applyCheckout(id, o);
+    }
+  } else if (type === 'charge.refunded' && o.payment_intent) {
+    // A refund made in the Stripe dashboard frees the time in the studio too.
+    const full = o.refunded === true || (o.amount != null && o.amount_refunded >= o.amount);
+    await changeByIntent(o.payment_intent, (x) => {
+      if (!full) { if (x.amountRefunded === o.amount_refunded) return NO_CHANGE; x.amountRefunded = o.amount_refunded; return; }
+      if (x.refunded && x.status === 'cancelled') return NO_CHANGE;
+      x.refunded = true; x.amountRefunded = o.amount_refunded;
+      if (x.status !== 'cancelled') { x.status = 'cancelled'; x.cancelledAt = Date.now(); x.cancelReason = 'Refunded in Stripe'; delete x.holdUntil; }
     });
+  } else if (type === 'charge.dispute.created' && o.payment_intent) {
+    let first = false;
+    const b = await changeByIntent(o.payment_intent, (x) => { first = !x.disputed; if (!first) return NO_CHANGE; x.disputed = true; });
+    if (b && first) await alertJorge('A client disputed a payment', ['A dispute was opened on this payment. Answer it in Stripe before its deadline.'], b);
   }
   return json({ received: true });
 }
@@ -294,7 +416,7 @@ async function postWebhook(req) {
 /* ---------- Jorge's back end ---------- */
 
 async function adminLogin(req, url, context) {
-  if (!auth.adminReady()) throw new HttpError(503, 'Set ADMIN_PASSWORD (8 characters or more) in Netlify to open the back end.');
+  if (!auth.adminReady()) throw new HttpError(503, 'Set ADMIN_PASSWORD (12 characters or more) in Netlify to open the back end.');
   const { password } = await readBody(req, 2000);
   if (!(await auth.throttle('login', ipOf(req, context), 8, 15 * 60e3))) throw new HttpError(429, 'Too many tries. Please wait 15 minutes and try again.');
   if (!(await auth.passwordOk(password))) throw new HttpError(401, 'That password is not right.');
@@ -303,16 +425,19 @@ async function adminLogin(req, url, context) {
 }
 
 async function adminLogout(req) {
+  try { await auth.endSessions(req); } catch (e) { /* the cookie is cleared either way */ }
   return json({ ok: true }, 200, { 'Set-Cookie': auth.sessionCookie(req, '', 0) });
 }
 
 async function adminData(req) {
   await auth.requireAdmin(req);
-  const [config, offerings, bookings, msgs] = await Promise.all([getConfig(), getOfferings(), getBookings(), read('messages', { list: [] })]);
+  let bookings = await getBookings();
+  if (await resolveLapsed(bookings)) bookings = await getBookings();
+  const [config, offerings, msgs] = await Promise.all([getConfig(), getOfferings(), read('messages', { list: [] })]);
   const now = Date.now();
   return json({
     config, offerings, now,
-    bookings: bookings.filter((b) => b.status !== 'expired' && !(b.status === 'hold' && b.holdUntil <= now)).sort((a, b) => a.start - b.start),
+    bookings: bookings.filter((b) => b.status !== 'expired' && !(b.status === 'hold' && b.holdUntil <= now && !b.stripeSession)).sort((a, b) => a.start - b.start),
     messages: msgs.data.list || [],
     setup: { payments: stripe.mode(), webhook: DEMO || !!env('STRIPE_WEBHOOK_SECRET'), email: mail.mailReady(), from: mail.fromAddress(), notify: notifyTo(config) || '' }
   });
@@ -390,25 +515,59 @@ async function adminCancel(req) {
   const id = clean(x.id, 40);
   const before = (await getBookings()).find((b) => b.id === id);
   if (!before) throw new HttpError(404, 'We could not find that booking.');
-  if (before.status === 'cancelled') throw new HttpError(409, 'That booking is already cancelled.');
-  let refundId = null;
-  if (x.refund && before.payment === 'stripe' && before.paymentIntent && !before.refunded && ['confirmed', 'processing'].includes(before.status)) {
-    refundId = (await stripe.refund(before.paymentIntent, 'nl-refund-' + id)).id;
+  if (before.status === 'cancelled' || before.status === 'expired') throw new HttpError(409, 'That booking is already closed.');
+  if (before.status === 'hold' && before.stripeSession) {
+    // Close the checkout first. If the client already paid, the booking is settled instead of cancelled blindly.
+    let s = null;
+    try { s = await stripe.expireCheckout(before.stripeSession); } catch (e) { try { s = await stripe.getCheckout(before.stripeSession); } catch (e2) { /* reported below */ } }
+    if (!s) throw new HttpError(502, 'Stripe did not answer, so the checkout is still open. Please try again in a moment.');
+    if (s.status === 'complete') {
+      await applyCheckout(id, s);
+      throw new HttpError(409, 'The client finished paying just now, so this booking is now confirmed. Cancel it again if you still want to.', { code: 'paid' });
+    }
   }
-  let sid = null;
+  const wantsRefund = !!x.refund;
+  let refundId = null, pending = false;
+  if (wantsRefund && before.payment === 'stripe' && before.paymentIntent && !before.refunded && ['confirmed', 'processing', 'review'].includes(before.status)) {
+    try { refundId = (await stripe.refund(before.paymentIntent, 'nl-refund-' + id)).id; }
+    catch (e) { if (before.status === 'processing') pending = true; else throw e; }
+  }
   const b = await changeBooking(id, (bk) => {
-    sid = null;
-    if (bk.status === 'cancelled') return NO_CHANGE;
-    if (bk.status === 'hold') sid = bk.stripeSession || null;
+    if (bk.status === 'cancelled' || bk.status === 'expired') return NO_CHANGE;
+    const paying = ['confirmed', 'processing', 'review'].includes(bk.status);
     bk.status = 'cancelled'; bk.cancelledAt = Date.now(); bk.cancelledBy = 'jorge'; delete bk.holdUntil;
     if (refundId) { bk.refunded = true; bk.refundId = refundId; }
+    if (paying && !wantsRefund) bk.keepPayment = true;
   });
-  if (sid) { try { await stripe.expireCheckout(sid); } catch (e) { /* already closed */ } }
   if (x.notify && b && b.client && b.client.email && before.status !== 'hold') {
     const config = await getConfig();
     await mail.send({ to: b.client.email, ...tpl.clientCancelled(b, config, !!refundId), replyTo: notifyTo(config) || undefined });
   }
-  return json({ ok: true, refunded: !!refundId, booking: b });
+  return json({ ok: true, refunded: !!refundId, refundPending: pending, booking: b });
+}
+
+/* A paid booking that overlaps another: Jorge keeps both. */
+async function adminConfirm(req) {
+  await auth.requireAdmin(req, true);
+  const id = clean((await readBody(req, 2000)).id, 40);
+  let changed = false;
+  const b = await changeBooking(id, (x) => { changed = false; if (x.status !== 'review') return NO_CHANGE; x.status = 'confirmed'; x.confirmedAt = Date.now(); changed = true; });
+  if (!b) throw new HttpError(404, 'We could not find that booking.');
+  if (!changed) throw new HttpError(409, 'Only bookings waiting for your decision can be confirmed here.');
+  const r = await sendClientConfirmation(b, await getConfig());
+  return json({ ok: true, emailed: !!(r && r.ok) });
+}
+
+async function adminResend(req) {
+  await auth.requireAdmin(req, true);
+  const id = clean((await readBody(req, 2000)).id, 40);
+  const b = (await getBookings()).find((x) => x.id === id && x.status === 'confirmed');
+  if (!b) throw new HttpError(404, 'We could not find that confirmed booking.');
+  if (!b.client.email) throw new HttpError(400, 'This booking has no email address.');
+  const r = await sendClientConfirmation(b, await getConfig());
+  if (!r || !r.ok) throw new HttpError(502, r && r.skipped ? 'Email sending is not set up yet.' : 'The email service did not take it. Please try again.');
+  await changeBooking(b.id, (x) => { if (!x.mailFailed) return NO_CHANGE; delete x.mailFailed; });
+  return json({ ok: true });
 }
 
 async function adminManual(req) {
@@ -431,8 +590,7 @@ async function adminManual(req) {
     client: { name: clean(x.name, 80) || 'Private time', email, phone: clean(x.phone, 40), intention: '' }, note: cleanText(x.note, 1000)
   };
   await update('bookings', { list: [] }, (d) => {
-    const clash = busyOf(d.list, Date.now()).some((o) => booking.start < o.end && booking.end > o.start);
-    if (clash && !x.force) throw new HttpError(409, 'That time overlaps another booking. Pick another time, or choose to book it anyway.', { code: 'overlap' });
+    if (overlaps(booking, d.list, Date.now()) && !x.force) throw new HttpError(409, 'That time overlaps another booking. Pick another time, or choose to book it anyway.', { code: 'overlap' });
     d.list.push(booking);
   });
   if (x.notify && email) await sendClientConfirmation(booking, config);
@@ -470,7 +628,7 @@ async function adminExport(req) {
     return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   };
   const rows = [['Date', 'Start', 'End', 'Session', 'Client', 'Email', 'Phone', 'Status', 'Paid', 'How paid', 'Refunded', 'Booked on']];
-  for (const b of bookings.filter((x) => ['confirmed', 'processing', 'cancelled'].includes(x.status)).sort((a, z) => a.start - z.start)) {
+  for (const b of bookings.filter((x) => ['confirmed', 'processing', 'review', 'cancelled'].includes(x.status)).sort((a, z) => a.start - z.start)) {
     rows.push([fmtDay(tz, b.start), fmtTime(tz, b.start), fmtTime(tz, b.end, true), b.offeringName, b.client.name, b.client.email, b.client.phone,
       b.status, money(b.amountPaid != null ? b.amountPaid : 0), b.payment, b.refunded ? 'yes' : '', new Date(b.createdAt).toISOString().slice(0, 10)]);
   }
@@ -484,7 +642,7 @@ async function demoPay(req) {
   const { session } = await readBody(req, 2000);
   const s = stripe.demoMarkPaid(clean(session, 80));
   if (!s) throw new HttpError(404, 'That demo checkout has closed. Please choose your time again.');
-  const b = await confirmBooking(s.metadata.bookingId, { paymentIntent: s.payment_intent, amount: s.amount_total });
+  const b = await applyCheckout(s.metadata.bookingId, s);
   return json({ ok: true, id: b && b.id });
 }
 
@@ -503,6 +661,8 @@ const ROUTES = {
   'POST admin/config': adminConfig,
   'POST admin/offerings': adminOfferings,
   'POST admin/cancel': adminCancel,
+  'POST admin/confirm': adminConfirm,
+  'POST admin/resend': adminResend,
   'POST admin/manual': adminManual,
   'POST admin/note': adminNote,
   'POST admin/messages': adminMessages,

@@ -11,7 +11,7 @@ Deploys happen automatically when this repository changes. Drag-and-drop deploys
 
 | Variable | What it is |
 | --- | --- |
-| `ADMIN_PASSWORD` | Jorge's studio password, at least 8 characters |
+| `ADMIN_PASSWORD` | Jorge's studio password, at least 12 characters |
 | `STRIPE_SECRET_KEY` | Stripe secret key (`sk_live_...` for real payments, `sk_test_...` to test) |
 | `STRIPE_WEBHOOK_SECRET` | Signing secret of the Stripe webhook below (`whsec_...`) |
 | `RESEND_API_KEY` | Resend API key for confirmation emails |
@@ -24,7 +24,8 @@ Deploys happen automatically when this repository changes. Drag-and-drop deploys
 
 Stripe Dashboard > Developers > Webhooks > Add endpoint:
 `https://nowlovelife.com/api/stripe-webhook`, events `checkout.session.completed`,
-`checkout.session.expired`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`.
+`checkout.session.expired`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`,
+`charge.refunded` and `charge.dispute.created`.
 
 ## Email
 

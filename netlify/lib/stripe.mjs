@@ -24,7 +24,7 @@ function encode(obj, prefix, out) {
 const demoSessions = new Map();
 function demo(method, path, params) {
   if (path === '/v1/checkout/sessions') {
-    const s = { id: 'cs_demo_' + rid(9), url: '#demo-pay', status: 'open', payment_status: 'unpaid', amount_total: params.line_items[0].price_data.unit_amount, metadata: params.metadata };
+    const s = { id: 'cs_demo_' + rid(9), url: '#demo-pay', status: 'open', payment_status: 'unpaid', currency: 'usd', amount_total: params.line_items[0].price_data.unit_amount, metadata: params.metadata };
     s.url = '#demo-pay=' + s.id;
     demoSessions.set(s.id, s);
     return s;
@@ -54,7 +54,7 @@ async function call(method, path, params, idem) {
   if (idem) headers['Idempotency-Key'] = idem;
   let res, data = {};
   try {
-    res = await fetch((env('STRIPE_API_BASE') || 'https://api.stripe.com') + path, { method, headers, body });
+    res = await fetch((env('STRIPE_API_BASE') || 'https://api.stripe.com') + path, { method, headers, body, signal: AbortSignal.timeout(10000) });
     data = await res.json();
   } catch (e) {
     console.error('stripe unreachable', e);
