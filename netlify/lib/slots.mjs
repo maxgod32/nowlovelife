@@ -18,8 +18,8 @@ export const DEFAULT_CONFIG = {
 };
 
 export const DEFAULT_OFFERINGS = [
-  { id: 'elevation-consultation', name: 'Spiritual Elevation Consultation', minutes: 60, priceCents: 75000, active: true,
-    description: 'A private hour with Jorge to see where you are, clear what is in the way and raise your vibration.' },
+  { id: 'elevation-consultation', name: 'Advisory Consult', minutes: 60, priceCents: 74900, active: true,
+    description: 'We assist with trauma healing, gaining spiritual elevation, accomplishing your goals, and becoming the Godhead version of you that God created you to become. Unlock your full potential.' },
   { id: 'elevation-course-2', name: 'Elevation Course, Two Hours', minutes: 120, priceCents: 150000, active: true,
     description: 'Two private hours: the Enlighten Method taught to you one to one, with practices to carry home.' },
   { id: 'elevation-course-3', name: 'Elevation Course, Three Hours', minutes: 180, priceCents: 225000, active: true,
