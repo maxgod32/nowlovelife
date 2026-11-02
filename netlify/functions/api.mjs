@@ -155,15 +155,16 @@ async function postBook(req, url, context) {
   const offering = offerings.find((o) => o.active && o.id === b.offering);
   if (!offering) throw new HttpError(404, 'That session is not available right now.');
   const paid = offering.priceCents > 0;
-  if (paid && stripe.mode() === 'off') throw new HttpError(503, 'Online booking opens very soon. Please message Jorge and he will book you in.');
+  // Before Stripe is connected, paid sessions are reserved straight away and Jorge arranges payment himself.
+  const later = paid && stripe.mode() === 'off';
   if (!(await auth.throttle('book', ipOf(req, context), BOOKINGS_PER_HOUR, 3600e3))) throw new HttpError(429, 'Too many booking attempts from here. Please wait a little and try again.');
   await resolveLapsed(await getBookings());
 
   const id = rid(15);
   const booking = {
-    id, status: paid ? 'hold' : 'confirmed', offeringId: offering.id, offeringName: offering.name, minutes: offering.minutes, priceCents: offering.priceCents,
-    start, end: start + offering.minutes * 60e3, createdAt: now, payment: paid ? 'stripe' : 'free',
-    ...(paid ? { holdUntil: now + HOLD_MINUTES * 60e3 } : { confirmedAt: now, amountPaid: 0 }),
+    id, status: paid && !later ? 'hold' : 'confirmed', offeringId: offering.id, offeringName: offering.name, minutes: offering.minutes, priceCents: offering.priceCents,
+    start, end: start + offering.minutes * 60e3, createdAt: now, payment: later ? 'later' : paid ? 'stripe' : 'free',
+    ...(paid && !later ? { holdUntil: now + HOLD_MINUTES * 60e3 } : { confirmedAt: now, amountPaid: 0 }),
     client: { name, email, phone, intention }
   };
   const prev = parts(config.timezone, start - 864e5);
@@ -171,7 +172,7 @@ async function postBook(req, url, context) {
     prune(d.list, now);
     const open = computeSlots({ config, offering, bookings: d.list, now, from: { y: prev.y, m: prev.m, d: prev.d }, days: 3 });
     if (!open.includes(start)) throw new HttpError(409, 'That time was just taken. Please choose another.', { code: 'taken' });
-    if (paid) {
+    if (paid && !later) {
       const waiting = d.list.filter((x) => x.status === 'hold' && x.holdUntil > now);
       if (waiting.length >= MAX_OPEN_HOLDS) throw new HttpError(429, 'Many people are booking right now. Please try again in a few minutes.');
       if (waiting.filter((x) => x.client && x.client.email === email).length >= 2) throw new HttpError(429, 'You already have times waiting for payment. Please finish or release those first.');
@@ -179,7 +180,7 @@ async function postBook(req, url, context) {
     d.list.push(booking);
   });
 
-  if (!paid) {
+  if (!paid || later) {
     await sendConfirmations(booking, config);
     return json({ id, confirmed: true });
   }
@@ -210,7 +211,7 @@ async function postBook(req, url, context) {
 function publicBooking(b, config) {
   return {
     id: b.id, status: b.status, offeringName: b.offeringName, minutes: b.minutes, priceCents: b.priceCents,
-    amountPaid: b.amountPaid, refunded: !!b.refunded, start: b.start, end: b.end, timezone: config.timezone, location: config.location,
+    amountPaid: b.amountPaid, payment: b.payment, refunded: !!b.refunded, start: b.start, end: b.end, timezone: config.timezone, location: config.location,
     policy: config.policy, firstName: String((b.client && b.client.name) || '').split(/\s+/)[0], email: mail.mailReady()
   };
 }
@@ -558,6 +559,15 @@ async function adminConfirm(req) {
   return json({ ok: true, emailed: !!(r && r.ok) });
 }
 
+/* A pay-later booking that Jorge has been paid for outside the site. */
+async function adminPaid(req) {
+  await auth.requireAdmin(req, true);
+  const id = clean((await readBody(req, 2000)).id, 40);
+  const b = await changeBooking(id, (x) => { if (x.payment !== 'later') return NO_CHANGE; x.payment = 'manual'; x.amountPaid = x.priceCents; x.paidAt = Date.now(); });
+  if (!b) throw new HttpError(404, 'We could not find that booking.');
+  return json({ ok: true });
+}
+
 async function adminResend(req) {
   await auth.requireAdmin(req, true);
   const id = clean((await readBody(req, 2000)).id, 40);
@@ -663,6 +673,7 @@ const ROUTES = {
   'POST admin/cancel': adminCancel,
   'POST admin/confirm': adminConfirm,
   'POST admin/resend': adminResend,
+  'POST admin/paid': adminPaid,
   'POST admin/manual': adminManual,
   'POST admin/note': adminNote,
   'POST admin/messages': adminMessages,

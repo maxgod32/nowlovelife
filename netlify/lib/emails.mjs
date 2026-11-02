@@ -23,7 +23,8 @@ export function clientConfirmed(b, config) {
   const subject = 'You are booked with Jorge: ' + fmtShort(config.timezone, b.start);
   const html = layout('You are booked, ' + first(b.client.name) + '.',
     p('Thank you for choosing to sit with Jorge. Your time is held and your session is confirmed.')
-    + table([row('Session', esc(b.offeringName)), row('When', esc(when)), row('Length', b.minutes + ' minutes'), row('Paid', esc(money(b.amountPaid != null ? b.amountPaid : b.priceCents)))])
+    + table([row('Session', esc(b.offeringName)), row('When', esc(when)), row('Length', b.minutes + ' minutes'), b.payment === 'later' ? row('Payment', esc(money(b.priceCents)) + ', arranged with Jorge') : row('Paid', esc(money(b.amountPaid != null ? b.amountPaid : b.priceCents)))])
+    + (b.payment === 'later' ? p('Jorge will contact you personally to arrange payment.') : '')
     + p(esc(config.location))
     + (config.policy ? p(esc(config.policy)) : '')
     + p('A calendar invite is attached. Reply to this email to reach Jorge directly.'));
@@ -37,7 +38,7 @@ export function jorgeNewBooking(b, config) {
   const html = layout('New session booked',
     table([row('Client', esc(b.client.name)), row('Email', '<a style="color:#c58cff;" href="mailto:' + esc(b.client.email) + '">' + esc(b.client.email) + '</a>'),
       row('Phone', esc(b.client.phone || 'Not given')), row('Session', esc(b.offeringName)), row('When', esc(when)),
-      row('Paid', esc(money(b.amountPaid != null ? b.amountPaid : b.priceCents)) + (b.payment === 'manual' ? ' (added by hand)' : ''))])
+      b.payment === 'later' ? row('Payment', esc(money(b.priceCents)) + ' due. Not paid yet: please arrange payment with the client.') : row('Paid', esc(money(b.amountPaid != null ? b.amountPaid : b.priceCents)) + (b.payment === 'manual' ? ' (added by hand)' : ''))])
     + (b.client.intention ? p('<b style="color:#fff;">What they would like to bring:</b><br>' + esc(b.client.intention).replace(/\n/g, '<br>')) : '')
     + p('Open your studio at nowlovelife.com/admin to see every booking.'));
   const text = subject + '\n\n' + b.client.name + ' <' + b.client.email + '>\n' + (b.client.phone || '') + '\n' + b.offeringName + '\n' + when + '\n\n' + (b.client.intention || '');

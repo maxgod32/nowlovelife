@@ -18,11 +18,11 @@ export const DEFAULT_CONFIG = {
 };
 
 export const DEFAULT_OFFERINGS = [
-  { id: 'elevation-consultation', name: 'Advisory Consult', minutes: 60, priceCents: 74900, active: true,
-    description: 'We assist with trauma healing, gaining spiritual elevation, accomplishing your goals, and becoming the Godhead version of you that God created you to become. Unlock your full potential.' },
-  { id: 'elevation-course-2', name: 'Elevation Course, Two Hours', minutes: 120, priceCents: 150000, active: true,
+  { id: 'elevation-consultation', name: 'Advisory Consult: All-Day Evolution Journey', minutes: 420, priceCents: 74900, active: true,
+    description: 'An all-day evolution healing journey with Jorge: finding your dream soulmate, growing your business and developing your super human abilities. We assist with trauma healing, gaining spiritual elevation, accomplishing your goals, and becoming the Godhead version of you that God created you to become. Unlock your full potential.' },
+  { id: 'elevation-course-2', name: 'Elevation Course, Two Hours', minutes: 120, priceCents: 150000, active: false,
     description: 'Two private hours: the Enlighten Method taught to you one to one, with practices to carry home.' },
-  { id: 'elevation-course-3', name: 'Elevation Course, Three Hours', minutes: 180, priceCents: 225000, active: true,
+  { id: 'elevation-course-3', name: 'Elevation Course, Three Hours', minutes: 180, priceCents: 225000, active: false,
     description: 'Three private hours in one sitting, for a deeper turning point and a path you can walk on your own.' }
 ];
 
