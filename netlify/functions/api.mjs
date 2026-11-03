@@ -196,6 +196,7 @@ async function postBook(req, url, context) {
       expires_at: Math.floor(now / 1000) + CHECKOUT_MINUTES * 60,
       line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: offering.priceCents, product_data: { name: withJorge(offering.name), description: when } } }],
       metadata: { bookingId: id },
+      custom_text: { submit: { message: 'All purchases are final. By paying you agree to the Now & Love Refund & Cancellation Policy: ' + site + '/refund-policy/' } },
       payment_intent_data: { metadata: { bookingId: id }, description: offering.name + ', ' + when },
       success_url: site + '/book/?b=' + id + '&session_id={CHECKOUT_SESSION_ID}',
       cancel_url: site + '/book/?released=' + id
