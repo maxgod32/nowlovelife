@@ -2,7 +2,7 @@
 import { esc, money } from './util.mjs';
 import { fmtWhen, fmtShort } from './time.mjs';
 
-function layout(title, inner) {
+export function layout(title, inner) {
   return '<!doctype html><html><body style="margin:0;padding:0;background:#0d0920;">'
     + '<div style="max-width:560px;margin:0 auto;padding:28px 18px;font-family:Helvetica,Arial,sans-serif;color:#ebe6ff;">'
     + '<div style="font-family:Georgia,serif;font-size:22px;letter-spacing:.04em;color:#ebe6ff;margin-bottom:18px;">Now <span style="color:#ff6ad5;">&amp;</span> Love</div>'
@@ -12,7 +12,7 @@ function layout(title, inner) {
     + '<p style="font-size:12px;color:#8f86b5;margin:18px 4px 0;">Now &amp; Love &middot; The Enlighten Method &middot; nowlovelife.com</p>'
     + '</div></body></html>';
 }
-const p = (t) => '<p style="font-size:15px;line-height:1.6;margin:0 0 12px;color:#d9d2f5;">' + t + '</p>';
+export const p = (t) => '<p style="font-size:15px;line-height:1.6;margin:0 0 12px;color:#d9d2f5;">' + t + '</p>';
 const row = (k, v) => '<tr><td style="padding:6px 12px 6px 0;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#a99fcf;vertical-align:top;white-space:nowrap;">' + esc(k)
   + '</td><td style="padding:6px 0;font-size:15px;color:#ffffff;">' + v + '</td></tr>';
 const table = (rows) => '<table role="presentation" style="border-collapse:collapse;margin:6px 0 16px;">' + rows.join('') + '</table>';

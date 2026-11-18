@@ -5,7 +5,7 @@ import { env, DEMO } from './env.mjs';
 export const mailReady = () => DEMO || !!env('RESEND_API_KEY');
 export const fromAddress = () => env('MAIL_FROM') || 'Now & Love <bookings@nowlovelife.com>';
 
-export async function send({ to, subject, html, text, replyTo, attachments }) {
+export async function send({ to, subject, html, text, replyTo, attachments, from }) {
   if (!to) return { ok: false, skipped: true };
   if (DEMO) {
     (globalThis.NL_DEMO_MAIL || (globalThis.NL_DEMO_MAIL = [])).push({ to, subject });
@@ -16,7 +16,7 @@ export async function send({ to, subject, html, text, replyTo, attachments }) {
   const post = (reply) => fetch((env('RESEND_API_BASE') || 'https://api.resend.com') + '/emails', {
     method: 'POST',
     headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: fromAddress(), to: [].concat(to), subject, html, text, reply_to: reply || undefined, attachments }),
+    body: JSON.stringify({ from: from || fromAddress(), to: [].concat(to), subject, html, text, reply_to: reply || undefined, attachments }),
     signal: AbortSignal.timeout(8000)
   });
   try {

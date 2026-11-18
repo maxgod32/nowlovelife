@@ -22,6 +22,9 @@ import { HttpError, json, readBody, clean, cleanText, isEmail, rid, sha256, hmac
 import * as stripe from './stripe.mjs';
 import { throttle, requireAdmin } from './auth.mjs';
 import { ics } from './ics.mjs';
+import * as mail from './mail.mjs';
+import * as mtpl from './member-emails.mjs';
+import { read as readBooking } from './store.mjs';
 
 /* ---------- storage ---------- */
 
@@ -238,6 +241,27 @@ async function syncBoardName(m) {
   });
 }
 
+/* ---------- email ---------- */
+
+const memberFrom = () => env('MEMBER_MAIL_FROM') || 'Now & Love <circle@nowlovelife.com>';
+const siteUrl = () => (env('SITE_URL') || 'https://nowlovelife.com').replace(/\/+$/, '');
+async function jorgeEmail() {
+  try { const { data } = await readBooking('config', {}); return (data && data.notifyEmail) || env('NOTIFY_EMAIL'); } catch (e) { return env('NOTIFY_EMAIL'); }
+}
+/* The first time a member's access opens (paid or gifted), they get a welcome and Jorge gets a note. Only the request
+   that marks the member as welcomed sends, so a webhook and a page load arriving together cannot send twice. */
+async function welcomeOnce(m, origin) {
+  if (!m || !isActive(m) || m.welcomed) return;
+  const r = await upd('m/' + m.id, null, (x) => { if (!x || x.welcomed || !isActive(x)) return NO_CHANGE; x.welcomed = Date.now(); });
+  if (!r.written) return;
+  const cfg = await config();
+  const tier = cfg.tiers.find((t) => t.id === r.data.tier);
+  if (!tier) return;
+  const gift = r.data.status === 'comp', jorge = await jorgeEmail();
+  await mail.send({ to: r.data.email, from: memberFrom(), replyTo: jorge || undefined, ...mtpl.welcome(r.data, tier, origin || siteUrl(), gift) });
+  if (jorge) await mail.send({ to: jorge, from: memberFrom(), replyTo: r.data.email, ...mtpl.jorgeNewMember(r.data, tier, r.data.interval, gift) });
+}
+
 /* ---------- Stripe: products, checkout, plan changes, billing ---------- */
 
 const policyText = (site) => 'Memberships renew automatically until cancelled. All purchases are final. By joining you agree to the Now & Love Refund & Cancellation Policy: ' + site + '/refund-policy/';
@@ -274,7 +298,7 @@ async function checkoutFor(m, tier, interval, origin) {
 const periodEndOf = (sub) => (sub.current_period_end || (sub.items && sub.items.data && sub.items.data[0] && sub.items.data[0].current_period_end) || 0) * 1000;
 /* Stripe is the source of truth: every event re-reads the subscription, so events arriving out of order cannot
    leave a member in the wrong state. */
-async function syncSubscription(subId, hintMemberId) {
+async function syncSubscription(subId, hintMemberId, origin) {
   const sub = await stripe.api('GET', '/v1/subscriptions/' + encodeURIComponent(subId));
   let id = (sub.metadata && sub.metadata.memberId) || hintMemberId;
   if (!id && sub.customer) id = ((await get('c/' + sub.customer)).data || {}).id;
@@ -297,6 +321,7 @@ async function syncSubscription(subId, hintMemberId) {
     x.updated = Date.now();
   });
   if (sub.customer) { const { data } = await get('c/' + sub.customer); if (!data || data.id !== id) await db().setJSON('c/' + sub.customer, { id }); }
+  await welcomeOnce(m, origin);
   return m;
 }
 
@@ -411,7 +436,7 @@ async function getConfig(req) {
   const cfg = await config();
   const m = await sessionMember(req);
   return ok({ tiers: cfg.tiers.map((t) => ({ id: t.id, name: t.name, tag: t.tag, blurb: t.blurb, perks: t.perks, color: t.color, monthly: t.monthly, yearly: t.yearly, featured: !!t.featured })),
-    categories: cfg.categories, levels: LEVELS, levelNames: cfg.levelNames, host: cfg.host, payments: stripe.mode() !== 'off', mode: stripe.mode(), signedIn: !!m });
+    categories: cfg.categories, levels: LEVELS, levelNames: cfg.levelNames, host: cfg.host, payments: stripe.mode() !== 'off', mode: stripe.mode(), mail: mail.mailReady(), signedIn: !!m });
 }
 
 async function postJoin(req, url, context) {
@@ -472,7 +497,7 @@ async function getMe(req, url) {
   if (sid && sid === m.pendingCheckout && !isActive(m)) {
     try {
       const s = await stripe.api('GET', '/v1/checkout/sessions/' + encodeURIComponent(sid));
-      if (s.status === 'complete' && s.subscription) m = (await syncSubscription(s.subscription, m.id)) || m;
+      if (s.status === 'complete' && s.subscription) m = (await syncSubscription(s.subscription, m.id, originOf(url))) || m;
     } catch (e) { /* the webhook settles it */ }
   }
   const [cfg, { data: board }] = await Promise.all([config(), get('board', { m: {} })]);
@@ -497,6 +522,36 @@ async function postPassword(req, url, context) {
   if (problem) throw new HttpError(400, problem, { field: 'next' });
   const pw = await hashPassword(b.next);
   const m = await changeMember(m0.id, (x) => { x.pw = pw; x.ver = (x.ver || 1) + 1; });
+  return ok({ ok: true }, { 'Set-Cookie': setCookie(req, await token(m), 30 * 86400) });
+}
+
+/* Forgotten password: a one-time link, valid for an hour, sent by email. The answer is the same whether or not the
+   email has an account, so nobody can use this to find out who is a member. */
+async function postForgot(req, url, context) {
+  const b = await readBody(req);
+  if (!(await throttle('forgot', ipOf(req, context), 6, 3600e3))) throw new HttpError(429, 'Too many tries. Please wait a little and try again.');
+  if (!mail.mailReady()) return ok({ mail: false });
+  const email = clean(b.email, 254).toLowerCase();
+  const idx = isEmail(email) ? (await get(await emailKey(email))).data : null;
+  const m0 = idx ? (await get('m/' + idx.id)).data : null;
+  if (m0 && !m0.banned && (await throttle('forgot-m-' + m0.id, 'member', 3, 3600e3))) {
+    const tok = rid(24), h = await sha256('reset:' + tok);
+    await changeMember(m0.id, (x) => { x.reset = { h, exp: Date.now() + 3600e3 }; });
+    await mail.send({ to: m0.email, from: memberFrom(), ...mtpl.reset(m0, originOf(url) + '/portal/#reset/' + m0.id + '/' + tok) });
+  }
+  return ok({ mail: true });
+}
+async function postReset(req, url, context) {
+  const b = await readBody(req);
+  if (!(await throttle('mreset', ipOf(req, context), 10, 3600e3))) throw new HttpError(429, 'Too many tries. Please wait a little and try again.');
+  const id = clean(b.id, 40), tok = clean(b.token, 80);
+  const problem = passwordProblem(b.password);
+  if (problem) throw new HttpError(400, problem, { field: 'password' });
+  const { data: m0 } = /^[A-Za-z0-9_-]{6,40}$/.test(id) ? await get('m/' + id) : { data: null };
+  const h = await sha256('reset:' + tok);
+  if (!m0 || m0.banned || !m0.reset || m0.reset.exp < Date.now() || !safeEqual(h, m0.reset.h)) throw new HttpError(400, 'This link has expired or was already used. Please ask for a new one.');
+  const pw = await hashPassword(b.password);
+  const m = await changeMember(id, (x) => { if (!x.reset || !safeEqual(h, x.reset.h)) throw new HttpError(400, 'This link was already used.'); x.pw = pw; x.ver = (x.ver || 1) + 1; delete x.reset; });
   return ok({ ok: true }, { 'Set-Cookie': setCookie(req, await token(m), 30 * 86400) });
 }
 
@@ -759,6 +814,7 @@ async function adminMember(req) {
   const m = await changeMember(id, update.fn);
   if (!m) throw new HttpError(404, 'That member is not here.');
   if (m.subscription && b.action !== 'reset') await syncSubscription(m.subscription, m.id).catch(() => {});
+  if (b.action === 'comp') await welcomeOnce((await get('m/' + id)).data);
   return ok({ ok: true, tempPassword: temp || undefined });
 }
 function cleanCourse(c, i) {
@@ -828,7 +884,7 @@ async function adminGetPost(req, url) {
 
 const MEMBER = {
   'GET config': getConfig, 'POST join': postJoin, 'POST login': postLogin, 'POST logout': postLogout, 'GET me': getMe,
-  'POST profile': postProfile, 'POST password': postPassword, 'POST billing': postBilling, 'POST plan': postPlan,
+  'POST profile': postProfile, 'POST password': postPassword, 'POST forgot': postForgot, 'POST reset': postReset, 'POST billing': postBilling, 'POST plan': postPlan,
   'GET feed': getFeed, 'GET post': getPost, 'POST post': postPost, 'POST post/edit': postEdit, 'POST post/delete': postDelete,
   'POST comment': postComment, 'POST comment/delete': postCommentDelete, 'POST like': postLike,
   'GET classroom': getClassroom, 'GET course': getCourse, 'POST progress': postProgress,
