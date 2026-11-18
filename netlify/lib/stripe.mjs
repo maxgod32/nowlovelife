@@ -69,6 +69,9 @@ async function call(method, path, params, idem) {
   return data;
 }
 
+/* Any Stripe call, for the members' subscriptions. */
+export const api = (method, path, params, idem) => call(method, path, params, idem);
+
 export const createCheckout = (params, idem) => call('POST', '/v1/checkout/sessions', params, idem);
 export const getCheckout = (id) => call('GET', '/v1/checkout/sessions/' + encodeURIComponent(id));
 export const expireCheckout = (id) => call('POST', '/v1/checkout/sessions/' + encodeURIComponent(id) + '/expire', {});

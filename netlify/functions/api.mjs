@@ -9,6 +9,7 @@
             POST /api/message           message Jorge directly
             POST /api/stripe-webhook    payment events from Stripe
    Jorge:   /api/admin/*                sign in, bookings, hours, sessions, messages, export
+   Members: /api/portal/*, /api/admin/portal/*   The Circle membership app (see lib/members.mjs)
 
    Booking states: hold (checkout open) -> confirmed, or processing (slow bank payment) -> confirmed, or
    review (paid, but the time overlaps another booking: Jorge decides). cancelled and expired free the time.
@@ -24,6 +25,7 @@ import { ics, toBase64 } from '../lib/ics.mjs';
 import * as auth from '../lib/auth.mjs';
 import { env, DEMO } from '../lib/env.mjs';
 import { parts, parseDay, validTZ, hm, zoned, fmtWhen, fmtDay, fmtTime } from '../lib/time.mjs';
+import * as members from '../lib/members.mjs';
 
 const HOLD_MINUTES = 33;      // a time stays held while its checkout is open
 const CHECKOUT_MINUTES = 31;  // Stripe's shortest allowed checkout lifetime is 30 minutes
@@ -35,6 +37,8 @@ export default async function handler(req, context) {
   const path = url.pathname.replace(/^\/api\/?/, '').replace(/\/+$/, '');
   const route = ROUTES[req.method + ' ' + path];
   try {
+    if (path.startsWith('portal/')) return await members.route(req, url, context, path.slice(7), false);
+    if (path.startsWith('admin/portal/')) return await members.route(req, url, context, path.slice(13), true);
     if (!route) return json({ error: 'Not found' }, 404);
     return await route(req, url, context);
   } catch (e) {
@@ -375,6 +379,8 @@ async function postWebhook(req) {
   }
   let ev;
   try { ev = JSON.parse(raw); } catch (e) { return json({ error: 'Invalid payload' }, 400); }
+  // Membership subscriptions (The Circle) are handled by the members module.
+  if (await members.onStripeEvent(ev)) return json({ received: true });
   const o = (ev.data && ev.data.object) || {};
   const type = String(ev.type || '');
   if (type.startsWith('checkout.session.')) {
